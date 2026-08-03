@@ -76,6 +76,8 @@ KonomiTV のセットアップが完了した後、Web ブラウザから各種�
 - EPG 取得状況の確認
 - DTV 関連のバックアップ実行（`konomitv-backup.sh`）
 
+![ロゴ画像](image-ph.png)
+
 コンテナ内で以下を実行してください。
 
 ```bash
@@ -148,6 +150,8 @@ bash ~/install-mirakc-edcb-konomitv.sh --rescan-only
 
 ## 注意事項
 
-- B-CAS キー・チャンネルデータ・EPG データ・予約録画情報・録画ファイル・個人情報は
-  このリポジトリに **push しない** でください（`.gitignore` で除外済み）。
 - 本リポジトリのファイルは、B-CAS カードを契約・所有し、個人的利用の範囲でのみ使用してください。
+
+## ライセンス
+
+このプロジェクトは [MIT License](LICENSE) の下で公開されています。
