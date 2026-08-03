@@ -1,0 +1,60 @@
+# ============================================================
+# .gitignore for mirakc-edcb-konomitv
+# このリポジトリはインストールスクリプトの管理用。
+# 個人情報・B-CASキー・チャンネルデータ・EPGデータ・予約録画情報・
+# 録画ファイルなどは絶対に push しないこと。
+# ============================================================
+
+# ---- 秘密情報・個人情報 ----
+# B-CAS キー
+**/bcas_keys
+*.key
+/key/
+
+# EDCB 設定 (予約情報・視聴履歴・個人設定を含む)
+EpgTimerSrv.ini
+Common.ini
+EpgDataCap_Bon.ini
+**/Setting/
+**/EpgData/
+
+# 予約録画情報・EPG データ
+*EpgData*
+*EpgTimer*
+*.tsp
+/tv/
+/video/
+
+# 録画ファイル・キャプチャ画像
+*.ts
+*.m2ts
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# ---- チャンネルデータ (環境依存の個人データ) ----
+/scanned/
+*ChSet*.txt
+*ChSet4*.txt
+*ChSet5*.txt
+
+# ---- ビルド物・クローンしたソース (GitHub から取得するため不要) ----
+/BonDriver_LinuxMirakc/
+/EDCB/
+/EDCB_Material_WebUI/
+/KonomiTV-Installer.elf
+/mirakc-src/
+/recisdb-rs/
+/libyakisoba/
+/libsobacas/
+/mirakc-arib/
+
+# ---- 設定・ログ・一時ファイル ----
+.env
+*.log
+*.tmp
+*.swp
+*~
+.DS_Store
