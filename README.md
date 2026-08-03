@@ -67,6 +67,28 @@ bash ~/install-mirakc-edcb-konomitv.sh
 8. EDCB（EpgTimerSrv）のセットアップ
 9. KonomiTV のインストール
 
+### 4. DTV管理ダッシュボードのインストール（任意）
+
+KonomiTV のセットアップが完了した後、Web ブラウザから各種操作ができる管理ダッシュボードをインストールできます。
+
+- EDCB / KonomiTV / mirakc の再起動
+- B-CAS キーの編集（保存すると mirakc を自動再起動）
+- EPG 取得状況の確認
+- DTV 関連のバックアップ実行（`konomitv-backup.sh`）
+
+コンテナ内で以下を実行してください。
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/hirogura/mirakc-edcb-konomitv/main/install-dtv-manage.sh)
+```
+
+実行内容:
+
+1. 必要なファイル（`konomitv-backup.sh` / `server.py` / `index.html`）を `/opt/dtv-manage` に配置
+2. systemd サービス `dtv-manage` を登録・起動（ポート 80 で HTTP サーバーを立ち上げ）
+
+インストール完了後、`http://<コンテナのIPアドレス>/` にアクセスするとダッシュボードが表示されます。
+
 ### バックアップからの復元（任意）
 
 ホストの `/opt/lxd-data/konomitv-backup`（または `/opt/lxd-data/リネーム`）に、
