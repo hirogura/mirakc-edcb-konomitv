@@ -257,6 +257,25 @@ import urllib.parse
 
 PORT = 80
 BASE = "/opt/dtv-manage"
+SERVICE_NAME = "dtv-manage"
+APP_VERSION = "1.0.0"
+
+# アップデート処理の状態管理用ファイル (/tmp に置くため再起動で自然にクリアされる)
+UPDATE_RUNNING_FILE = "/tmp/dtv-manage-update.running"
+UPDATE_EXIT_FILE = "/tmp/dtv-manage-update.exit"
+UPDATE_LOG_FILE = "/tmp/dtv-manage-update.log"
+
+# GitHub から最新のインストーラを取得して実行するコマンド
+# (install-dtv-manage.sh 自体が最後に dtv-manage サービスを再起動するため、
+#  実行はバックグラウンドで行い、API は即座に応答を返す)
+UPDATE_COMMAND = (
+    "set -o pipefail; "
+    "curl -fsSL "
+    "https://raw.githubusercontent.com/hirogura/mirakc-edcb-konomitv/main/install-dtv-manage.sh"
+    " | bash >> " + UPDATE_LOG_FILE + " 2>&1; "
+    "echo $? > " + UPDATE_EXIT_FILE + "; "
+    "rm -f " + UPDATE_RUNNING_FILE
+)
 
 # 非対話シェルでも各種コマンドが見つかるよう PATH を明示的に拡張
 # (/usr/local/bin/pm2 が壊れている/存在しない場合に備え、pm2 の代表的な実体パスも含める)
@@ -347,6 +366,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_epg_status()
         elif path == "/api/bcas-keys":
             self.handle_get_bcas()
+        elif path == "/api/update/status":
+            self.handle_update_status()
         else:
             self.send_error(404, "Not Found")
 
@@ -361,6 +382,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_restart(["pm2", "restart", "KonomiTV"])
         elif path == "/api/restart/mirakc":
             self.handle_restart(["systemctl", "restart", "mirakc"])
+        elif path == "/api/restart/self":
+            self.handle_restart(["systemctl", "restart", SERVICE_NAME])
+        elif path == "/api/update":
+            self.handle_update()
         elif path == "/api/backup":
             self.handle_backup()
         elif path == "/api/bcas-keys":
@@ -375,6 +400,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 content = f.read()
             self.send_response(200)
             self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
             self.send_header("Content-Length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)
@@ -385,11 +411,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         container = get_container_name()
         self.send_json({
             "container_name": container,
+            "version": APP_VERSION,
             "edcb_url": f"http://{container}:5510/",
             "edcb_links": [
                 {"label": "EDCB WebUI", "url": f"http://{container}:5510/"},
                 {"label": "legacy", "url": f"http://{container}:5510/legacy/"},
-                {"label": "番組表", "url": f"http://{container}:5510/EMWUI/epg.html"}
+                {"label": "番組表", "url": f"http://{container}:5510/E3/#epg"}
             ],
             "konomi_urls": get_konomi_urls(),
         })
@@ -468,11 +495,63 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error_json(str(e))
 
+    def handle_update(self):
+        # 同時実行防止
+        if os.path.exists(UPDATE_RUNNING_FILE):
+            self.send_error_json("アップデートが既に実行中です")
+            return
+        try:
+            # マーカーファイルはサーバー側で先に作成し、
+            # バックグラウンド処理の終了時に削除される
+            with open(UPDATE_RUNNING_FILE, "w") as f:
+                f.write(str(os.getpid()))
+            if os.path.exists(UPDATE_EXIT_FILE):
+                os.remove(UPDATE_EXIT_FILE)
+            subprocess.Popen(
+                ["bash", "-c", UPDATE_COMMAND],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=ENV,
+                start_new_session=True
+            )
+            self.send_json({"success": True})
+        except Exception as e:
+            try:
+                os.remove(UPDATE_RUNNING_FILE)
+            except OSError:
+                pass
+            self.send_error_json(str(e))
+
+    def handle_update_status(self):
+        running = os.path.exists(UPDATE_RUNNING_FILE)
+        log_tail = ""
+        try:
+            with open(UPDATE_LOG_FILE, "r", errors="replace") as f:
+                log_tail = f.read()[-2000:]
+        except FileNotFoundError:
+            pass
+        exit_code = None
+        try:
+            with open(UPDATE_EXIT_FILE) as f:
+                exit_code = int(f.read().strip())
+        except (FileNotFoundError, ValueError):
+            pass
+        self.send_json({"running": running, "log": log_tail, "exit": exit_code})
+
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
 if __name__ == "__main__":
+    # 前回のアップデート処理が残した状態ファイルを掃除
+    # (アップデート完了時のサービス再起動でバックグラウンド処理が
+    #  強制終了され、マーカーが削除されないまま残ることがあるため)
+    for stale in (UPDATE_RUNNING_FILE, UPDATE_EXIT_FILE):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"DTV Management Dashboard running on port {PORT}")
     server.serve_forever()
@@ -490,7 +569,9 @@ sudo tee "$INSTALL_DIR/index.html" > /dev/null << 'HTMLEOF'
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;padding:20px}
-h1{text-align:center;font-size:1.5rem;padding:16px 0;color:#38bdf8;border-bottom:1px solid #1e293b;margin-bottom:20px}
+h1{display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:10px;font-size:1.5rem;padding:16px 12px;color:#38bdf8;border-bottom:1px solid #1e293b;margin-bottom:20px}
+.version{font-size:0.7rem;color:#94a3b8;background:#1e293b;border:1px solid #334155;border-radius:999px;padding:2px 8px;font-weight:600;letter-spacing:.03em}
+.header-actions{display:inline-flex;gap:8px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;max-width:1000px;margin:0 auto}
 .card{background:#1e293b;border-radius:10px;padding:20px;border:1px solid #334155}
 .card h2{font-size:1rem;color:#94a3b8;margin-bottom:12px;display:flex;align-items:center;gap:8px}
@@ -502,6 +583,7 @@ h1{text-align:center;font-size:1.5rem;padding:16px 0;color:#38bdf8;border-bottom
 .info-value a{color:#38bdf8;text-decoration:none}
 .info-value a:hover{text-decoration:underline}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border:none;border-radius:6px;font-size:0.85rem;cursor:pointer;transition:all .15s;font-weight:500}
+.btn-sm{padding:4px 10px;font-size:0.75rem}
 .btn-restart{background:#2563eb;color:#fff}
 .btn-restart:hover{background:#1d4ed8}
 .btn-success{background:#16a34a;color:#fff}
@@ -511,6 +593,7 @@ h1{text-align:center;font-size:1.5rem;padding:16px 0;color:#38bdf8;border-bottom
 .btn:disabled{opacity:0.5;cursor:not-allowed}
 .btn-group{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
 .output-box{background:#0f172a;border:1px solid #334155;border-radius:6px;padding:10px;margin-top:10px;font-family:monospace;font-size:0.8rem;white-space:pre-wrap;max-height:200px;overflow-y:auto;display:none;color:#a5f3fc}
+.update-log{max-width:1000px;margin:0 auto 16px}
 textarea.bcas-editor{width:100%;height:180px;background:#0f172a;border:1px solid #334155;border-radius:6px;padding:10px;font-family:monospace;font-size:0.8rem;color:#e2e8f0;resize:vertical;margin-top:8px}
 textarea.bcas-editor:focus{outline:none;border-color:#38bdf8}
 .toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;color:#fff;font-size:0.85rem;z-index:1000;opacity:0;transition:opacity .3s;pointer-events:none}
@@ -521,7 +604,8 @@ textarea.bcas-editor:focus{outline:none;border-color:#38bdf8}
 </style>
 </head>
 <body>
-<h1>DTV Management Dashboard</h1>
+<h1>DTV Management Dashboard<span class="version" id="app-version">v...</span><span class="header-actions"><button class="btn btn-success btn-sm" id="update-btn" onclick="runUpdate()">アップデート</button><button class="btn btn-secondary btn-sm" id="restart-self-btn" onclick="restartSelf()">再起動</button></span></h1>
+<div class="output-box update-log" id="update-output"></div>
 <div class="grid">
   <div class="card">
     <h2><span class="icon">&#128250;</span> KonomiTV</h2>
@@ -593,10 +677,15 @@ async function api(method, path, body) {
   return res.json();
 }
 
+function sleep(ms) {
+  return new Promise(function(r) { setTimeout(r, ms); });
+}
+
 async function loadInfo() {
   try {
     const info = await api('GET', '/api/info');
     document.getElementById('container-name').textContent = info.container_name;
+    document.getElementById('app-version').textContent = 'v.' + info.version;
 
     const edcbEl = document.getElementById('edcb-links');
     edcbEl.innerHTML = '';
@@ -686,6 +775,83 @@ async function runBackup() {
     btn.disabled = false;
     btn.textContent = 'DTV関連バックアップ';
   }
+}
+
+async function restartSelf() {
+  if (!confirm('DTV Management Dashboard を再起動しますか？')) return;
+  const btn = document.getElementById('restart-self-btn');
+  btn.disabled = true;
+  showToast('再起動中...', 'info');
+  try {
+    await api('POST', '/api/restart/self');
+  } catch (e) {
+    // 再起動に伴う切断は想定内なので無視する
+  }
+  for (let i = 0; i < 30; i++) {
+    await sleep(1000);
+    try {
+      await api('GET', '/api/info');
+      showToast('再起動完了', 'success');
+      setTimeout(function() { location.reload(); }, 800);
+      return;
+    } catch (e) {}
+  }
+  showToast('サーバー応答がありません。ページを手動で再読み込みしてください。', 'error');
+  btn.disabled = false;
+}
+
+async function runUpdate() {
+  if (!confirm('GitHubから最新版を取得してアップデートしますか？\n(完了後、ダッシュボードが自動的に再起動・再読み込みされます)')) return;
+  const btn = document.getElementById('update-btn');
+  btn.disabled = true;
+  showOutput('update-output', 'アップデートを開始しています...');
+  try {
+    await api('POST', '/api/update');
+  } catch (e) {
+    showOutput('update-output', 'エラー: ' + e.message);
+    showToast('アップデートを開始できませんでした', 'error');
+    btn.disabled = false;
+    return;
+  }
+  showToast('アップデートを実行中です...', 'info');
+  pollUpdate(0);
+}
+
+async function pollUpdate(elapsed) {
+  const btn = document.getElementById('update-btn');
+  await sleep(3000);
+  elapsed += 3;
+  let st;
+  try {
+    st = await api('GET', '/api/update/status');
+  } catch (e) {
+    // インストーラー最後のサービス再起動による切断は正常な流れ
+    if (elapsed < 300) { pollUpdate(elapsed); }
+    else { updateTimeout(btn); }
+    return;
+  }
+  if (st.running) {
+    showOutput('update-output', 'アップデート実行中... (' + elapsed + '秒経過)\n\n' + (st.log || ''));
+    if (elapsed < 300) { pollUpdate(elapsed); }
+    else { updateTimeout(btn); }
+    return;
+  }
+  // 実行終了: exit コードを確認
+  // (exit ファイルなし = サービス再起動時にプロセスが停止された = 成功)
+  if (st.exit !== null && st.exit !== undefined && st.exit !== 0) {
+    showOutput('update-output', 'アップデートに失敗しました (exit=' + st.exit + ')\n\n' + (st.log || ''));
+    showToast('アップデートに失敗しました', 'error');
+    btn.disabled = false;
+    return;
+  }
+  showOutput('update-output', (st.log || '') + '\n=== アップデート完了 ===');
+  showToast('アップデート完了。再読み込みします...', 'success');
+  setTimeout(function() { location.reload(); }, 2000);
+}
+
+function updateTimeout(btn) {
+  showToast('アップデートがタイムアウトしました。ログをご確認ください。', 'error');
+  btn.disabled = false;
 }
 
 async function loadBcasKeys() {
