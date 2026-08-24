@@ -591,7 +591,7 @@ from datetime import datetime
 PORT = 80
 BASE = "/opt/dtv-manage"
 SERVICE_NAME = "dtv-manage"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 # アップデート処理の状態管理用ファイル (/tmp に置くため再起動で自然にクリアされる)
 UPDATE_RUNNING_FILE = "/tmp/dtv-manage-update.running"
@@ -815,6 +815,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json({"error": message}, status)
 
     def do_GET(self):
+        try:
+            self.route_get()
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+        except Exception as e:
+            # 未捕捉例外でも接続を切らず JSON エラーとして返す
+            # (接続切断だとブラウザ側は原因不明の「失敗」しか表示できないため)
+            try:
+                self.send_error_json(f"サーバー内部エラー: {e}")
+            except Exception:
+                pass
+
+    def route_get(self):
         path = urllib.parse.urlparse(self.path).path
         if path == "/" or path == "/index.html":
             self.serve_file("index.html", "text/html")
@@ -836,6 +849,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
 
     def do_POST(self):
+        try:
+            self.route_post()
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+        except Exception as e:
+            try:
+                self.send_error_json(f"サーバー内部エラー: {e}")
+            except Exception:
+                pass
+
+    def route_post(self):
         path = urllib.parse.urlparse(self.path).path
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else b""
@@ -998,7 +1022,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json(KONOMI_SESSION.snapshot(offset))
 
     def handle_konomi_start(self):
-        ok, err = KONOMI_SESSION.start(["bash", KONOMI_UPDATE_SCRIPT])
+        ok, err = KONOMI_SESSION.start(KONOMI_UPDATE_SCRIPT)
         if ok:
             self.send_json({"success": True})
         else:
@@ -1645,7 +1669,7 @@ async function startKonomiUpdate() {
       return;
     }
   } catch (e) {
-    showToast('アップデートを開始できませんでした', 'error');
+    showToast('アップデートを開始できませんでした' + (e && e.message ? ' (' + e.message + ')' : ''), 'error');
     return;
   }
   showToast('インストーラーを起動しました。ターミナルで対話してください', 'info');
