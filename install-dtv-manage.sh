@@ -475,21 +475,123 @@ RESCANEOF
 
 sudo chmod +x "$INSTALL_DIR/dtv-rescan.sh"
 
+# konomitv-update.sh
+# (Web UI の「KonomiTV アップデート」ボタンから server.py が PTY 上で
+#  起動するスクリプト本体。出力はブラウザのターミナルに表示され、
+#  インストーラーの質問にはブラウザから入力して対話する)
+sudo tee "$INSTALL_DIR/konomitv-update.sh" > /dev/null << 'KONOMIEOF'
+#!/bin/bash
+# =============================================================
+# konomitv-update.sh - KonomiTV アップデート用ラッパー
+# dtv-manage の Web UI (server.py) が PTY 上で起動し、対話操作を
+# ブラウザのターミナルに中継する。常に root 前提。
+# =============================================================
+set -u
+
+export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH"
+
+DTV_DIR="/root/dtv"
+mkdir -p "$DTV_DIR"
+
+echo "=== KonomiTV アップデート ==="
+echo ""
+
+# ------------------------------------------------------------
+# pm2 のパス対策
+#
+# nvm 経由で Node.js をインストールした環境では pm2 の実体が
+#   /root/.nvm/versions/node/<バージョン>/bin/pm2
+# に置かれる。LXD コンテナ内の非インタラクティブシェルでは nvm の
+# PATH が通らないため、KonomiTV インストーラーが内部で呼ぶ PM2 操作が
+# 「PM2 を呼ぼうとして失敗」する。
+# 対策: 実際に存在する pm2 へのシンボリックリンクを /usr/local/bin/pm2
+# に張ってからインストーラーを起動する (バージョン番号はハードコードしない)。
+# ------------------------------------------------------------
+PM2_REAL=""
+for c in "$(command -v pm2 2>/dev/null)" \
+         /root/.nvm/versions/node/*/bin/pm2 \
+         "$HOME/.nvm/versions/node/"*/bin/pm2 \
+         /usr/local/lib/node_modules/pm2/bin/pm2; do
+    if [ -n "$c" ] && [ -e "$c" ]; then
+        PM2_REAL="$c"
+        break
+    fi
+done
+
+if [ -z "$PM2_REAL" ]; then
+    echo "WARNING: pm2 が見つかりません。アップデート完了後の自動起動に失敗する可能性があります"
+else
+    PM2_REAL="$(readlink -f "$PM2_REAL")"
+    PM2_BINDIR="$(dirname "$PM2_REAL")"
+    # nvm 配下の pm2 だった場合は node も必要になるため bin ディレクトリを PATH に追加
+    case "$PM2_BINDIR" in
+        */.nvm/versions/node/*/bin) export PATH="$PM2_BINDIR:$PATH" ;;
+    esac
+
+    CURRENT_TARGET="$(readlink -f /usr/local/bin/pm2 2>/dev/null || true)"
+    if [ "$CURRENT_TARGET" != "$PM2_REAL" ]; then
+        ln -sf "$PM2_REAL" /usr/local/bin/pm2
+        echo "pm2 のシンボリックリンクを作成/更新しました:"
+        echo "  /usr/local/bin/pm2 -> $PM2_REAL"
+    else
+        echo "pm2 のシンボリックリンクは最新です: /usr/local/bin/pm2 -> $PM2_REAL"
+    fi
+    echo "pm2 バージョン: $(pm2 --version 2>/dev/null || echo '確認できず')"
+fi
+echo ""
+
+# ------------------------------------------------------------
+# 最新インストーラーのダウンロードと起動
+# KonomiTV のアップデートは「インストーラーを再実行するだけ」なので、
+# 毎回最新版を取り直してから対話モードで起動する。
+# ------------------------------------------------------------
+echo "[1/2] 最新の KonomiTV インストーラーをダウンロード中..."
+cd "$DTV_DIR" || exit 1
+rm -f KonomiTV-Installer.elf.new
+curl -fL --retry 3 --retry-delay 2 -o KonomiTV-Installer.elf.new \
+    https://github.com/tsukumijima/KonomiTV/releases/latest/download/KonomiTV-Installer.elf || {
+    echo "ERROR: インストーラーのダウンロードに失敗しました (ネットワークを確認してください)"
+    exit 1
+}
+mv KonomiTV-Installer.elf.new KonomiTV-Installer.elf
+chmod +x KonomiTV-Installer.elf
+echo "      ダウンロード完了"
+echo ""
+
+echo "[2/2] インストーラーを起動します"
+echo ""
+echo "============================================================"
+echo " これより KonomiTV インストーラーが対話モードで起動します。"
+echo " 既存環境がある場合はアップデートとして動作しますので、"
+echo " 画面の指示に従い、Web UI 下部の入力欄から回答してください。"
+echo "============================================================"
+sleep 1
+
+exec ./KonomiTV-Installer.elf
+KONOMIEOF
+
+sudo chmod +x "$INSTALL_DIR/konomitv-update.sh"
+
 # server.py
 sudo tee "$INSTALL_DIR/server.py" > /dev/null << 'PYEOF'
 #!/usr/bin/env python3
 import http.server
 import json
 import os
+import pty
 import socketserver
+import struct
 import subprocess
+import termios
+import fcntl
+import threading
 import urllib.parse
 from datetime import datetime
 
 PORT = 80
 BASE = "/opt/dtv-manage"
 SERVICE_NAME = "dtv-manage"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # アップデート処理の状態管理用ファイル (/tmp に置くため再起動で自然にクリアされる)
 UPDATE_RUNNING_FILE = "/tmp/dtv-manage-update.running"
@@ -504,6 +606,10 @@ RESCAN_EXIT_FILE = "/tmp/dtv-manage-rescan.exit"
 RESCAN_LOG_FILE = "/tmp/dtv-manage-rescan.log"
 RESCAN_SCRIPT = os.path.join(BASE, "dtv-rescan.sh")
 SCANNED_CONFIG = "/root/dtv/scanned/mirakc/config.yml"
+
+# KonomiTV アップデート (対話式ターミナル)
+KONOMI_UPDATE_SCRIPT = os.path.join(BASE, "konomitv-update.sh")
+KONOMI_DTV_DIR = "/root/dtv"
 
 # GitHub から最新のインストーラを取得して実行するコマンド
 # (install-dtv-manage.sh 自体が最後に dtv-manage サービスを再起動するため、
@@ -525,6 +631,118 @@ ENV["PATH"] = (
     "/usr/local/lib/node_modules/pm2/bin:"
     + ENV.get("PATH", "")
 )
+
+class KonomiSession:
+    """KonomiTV インストーラーを PTY 上で動かし、対話を HTTP 経由に中継する。
+
+    - start()   : konomitv-update.sh を pty.fork() で起動し、読み取りスレッド開始
+    - write()   : ブラウザからの入力 (1行 + \r や Ctrl+C の \x03) を PTY へ書き込む
+    - snapshot(): offset 以降の出力差分と稼働状態を返す (ブラウザはポーリング)
+    出力は全量メモリ保持だが、インストーラーの出力は高々数百KB程度のため
+    トリミングは行わない (offset 指定の単純さを優先)。
+    サーバー再起動時は子プロセスが SIGHUP で終了するためセッションも消滅する。
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.buffer = ""
+        self.master_fd = None
+        self.pid = None
+        self.running = False
+        self.exit_code = None
+
+    def start(self, script_path):
+        argv = ["bash", script_path]
+        with self.lock:
+            if self.running:
+                return False, "アップデートが既に実行中です"
+            if not os.path.exists(script_path):
+                return False, f"スクリプトが見つかりません: {script_path}"
+            try:
+                pid, fd = pty.fork()
+            except OSError as e:
+                return False, f"PTY の作成に失敗しました: {e}"
+            if pid == 0:
+                # 子プロセス: 疑似端末上でインストーラーを実行
+                # (作業ディレクトリはラッパースクリプト側で作成・移動するため、
+                #  ここでの chdir 失敗は致命的ではない)
+                try:
+                    os.environ["TERM"] = "dumb"
+                    try:
+                        os.chdir(KONOMI_DTV_DIR)
+                    except OSError:
+                        pass
+                    os.execvp(argv[0], argv)
+                except Exception:
+                    os._exit(127)
+            self.pid = pid
+            self.master_fd = fd
+            self.buffer = ""
+            self.exit_code = None
+            self.running = True
+            # 端末サイズを設定しておく (TERM=dumb でも参照する実装があるため)
+            try:
+                fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+            except OSError:
+                pass
+        threading.Thread(target=self._reader, daemon=True).start()
+        return True, ""
+
+    def _reader(self):
+        fd = self.master_fd
+        while True:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            with self.lock:
+                self.buffer += data.decode("utf-8", errors="replace")
+        # EOF 到達 = 子プロセス終了。終了コードを回収してから状態を更新する
+        exit_code = None
+        try:
+            _, status = os.waitpid(self.pid, 0)
+            exit_code = os.waitstatus_to_exitcode(status)
+        except (ChildProcessError, AttributeError, OSError):
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        with self.lock:
+            self.running = False
+            self.exit_code = exit_code
+            self.master_fd = None
+
+    def write(self, data):
+        with self.lock:
+            if not self.running or self.master_fd is None:
+                return False
+            try:
+                os.write(self.master_fd, data.encode("utf-8"))
+                return True
+            except OSError:
+                return False
+
+    def snapshot(self, offset=0):
+        with self.lock:
+            total = len(self.buffer)
+            output = ""
+            if 0 <= offset < total:
+                output = self.buffer[offset:]
+            return {
+                "running": self.running,
+                "exit": self.exit_code,
+                "total": total,
+                "output": output,
+            }
+
+    def status(self):
+        with self.lock:
+            return {"running": self.running, "exit": self.exit_code, "total": len(self.buffer)}
+
+KONOMI_SESSION = KonomiSession()
 
 def get_container_name():
     try:
@@ -610,6 +828,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_update_status()
         elif path == "/api/rescan/status":
             self.handle_rescan_status()
+        elif path == "/api/konomitv-update/status":
+            self.send_json(KONOMI_SESSION.status())
+        elif path == "/api/konomitv-update/output":
+            self.handle_konomi_output()
         else:
             self.send_error(404, "Not Found")
 
@@ -632,6 +854,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_backup()
         elif path == "/api/rescan":
             self.handle_rescan()
+        elif path == "/api/konomitv-update/start":
+            self.handle_konomi_start()
+        elif path == "/api/konomitv-update/input":
+            self.handle_konomi_input(body)
         elif path == "/api/bcas-keys":
             self.handle_save_bcas(body)
         else:
@@ -762,6 +988,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         data = {"running": running, "exit": exit_code, "log": log_tail}
         data.update(self.get_scan_info())
         self.send_json(data)
+
+    def handle_konomi_output(self):
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            offset = int(params.get("offset", ["0"])[0])
+        except ValueError:
+            offset = 0
+        self.send_json(KONOMI_SESSION.snapshot(offset))
+
+    def handle_konomi_start(self):
+        ok, err = KONOMI_SESSION.start(["bash", KONOMI_UPDATE_SCRIPT])
+        if ok:
+            self.send_json({"success": True})
+        else:
+            self.send_error_json(err)
+
+    def handle_konomi_input(self, body):
+        try:
+            data = str(json.loads(body or b"{}").get("data", ""))[:512]
+        except Exception:
+            data = ""
+        if not data:
+            self.send_error_json("入力データが空です")
+            return
+        if not KONOMI_SESSION.write(data):
+            self.send_error_json("実行中のアップデートセッションがありません")
+            return
+        self.send_json({"success": True})
 
     def handle_get_bcas(self):
         try:
@@ -913,6 +1167,10 @@ textarea.bcas-editor:focus{outline:none;border-color:#38bdf8}
 .toast.success{background:#16a34a}
 .toast.error{background:#dc2626}
 .toast.info{background:#2563eb}
+.terminal{background:#0a1628;border:1px solid #334155;border-radius:6px;padding:10px;margin-top:10px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:0.75rem;line-height:1.4;color:#d7e5ff;white-space:pre-wrap;word-break:break-all;height:300px;overflow-y:auto;display:none}
+.terminal-input-row{display:none;gap:6px;margin-top:6px}
+.terminal-input-row input{flex:1;background:#0f172a;border:1px solid #334155;border-radius:6px;padding:8px;color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:0.85rem}
+.terminal-input-row input:focus{outline:none;border-color:#38bdf8}
 </style>
 </head>
 <body>
@@ -953,6 +1211,22 @@ textarea.bcas-editor:focus{outline:none;border-color:#38bdf8}
       <button class="btn btn-success" id="rescan-btn" onclick="runRescan()">チャンネルスキャン再実行</button>
     </div>
     <div class="output-box" id="rescan-output"></div>
+  </div>
+  <div class="card">
+    <h2><span class="icon">&#128230;</span> KonomiTV アップデート</h2>
+    <div class="info-row">
+      <span class="info-label">状態</span>
+      <span class="info-value" id="konomi-status">待機中</span>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-success" id="konomi-update-btn" onclick="startKonomiUpdate()">KonomiTV アップデート</button>
+      <button class="btn btn-secondary" id="konomi-ctrlc-btn" style="display:none" onclick="sendKonomiCtrlC()">Ctrl+C (中断)</button>
+    </div>
+    <div class="terminal" id="konomi-terminal"></div>
+    <div class="terminal-input-row" id="konomi-input-row">
+      <input type="text" id="konomi-input" placeholder="インストーラーへの回答を入力して Enter..." autocomplete="off">
+      <button class="btn btn-restart btn-sm" onclick="sendKonomiInput()">送信</button>
+    </div>
   </div>
   <div class="card">
     <h2><span class="icon">&#128273;</span> BCASキー設定</h2>
@@ -1287,8 +1561,129 @@ async function initScanCard() {
   }
 }
 
+let konomiActive = false;
+let konomiOffset = 0;
+let konomiErrorCount = 0;
+
+function stripAnsi(s) {
+  return s
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+    .replace(/\x1b\].*?(\x07|\x1b\\)/g, '')
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '');
+}
+
+function termWrite(text) {
+  const el = document.getElementById('konomi-terminal');
+  el.textContent += stripAnsi(text);
+  el.scrollTop = el.scrollHeight;
+}
+
+function setKonomiUI(running) {
+  document.getElementById('konomi-update-btn').disabled = running;
+  document.getElementById('konomi-ctrlc-btn').style.display = running ? 'inline-flex' : 'none';
+  document.getElementById('konomi-input-row').style.display = running ? 'flex' : 'none';
+  document.getElementById('konomi-status').textContent = running ? '実行中...' : '待機中';
+}
+
+function openKonomiTerminal() {
+  const el = document.getElementById('konomi-terminal');
+  el.textContent = '';
+  el.style.display = 'block';
+}
+
+function finishKonomi(st) {
+  konomiActive = false;
+  setKonomiUI(false);
+  termWrite('\n=== 終了 (exit=' + st.exit + ') ===\n');
+  showToast(st.exit === 0 ? 'KonomiTV アップデート完了' : 'アップデートが終了しました (exit=' + st.exit + ')',
+    st.exit === 0 ? 'success' : 'error');
+}
+
+function pollKonomi() {
+  api('GET', '/api/konomitv-update/output?offset=' + konomiOffset).then(function(st) {
+    konomiErrorCount = 0;
+    if (!konomiActive) return;
+    if (st.output) termWrite(st.output);
+    konomiOffset = st.total;
+    if (st.running) {
+      setTimeout(pollKonomi, 600);
+    } else {
+      finishKonomi(st);
+    }
+  }).catch(function() {
+    // サーバー側の一時的なエラー (再起動直後など) には数回は耐える
+    if (konomiActive && ++konomiErrorCount < 10) {
+      setTimeout(pollKonomi, 1500);
+    } else {
+      konomiActive = false;
+      setKonomiUI(false);
+    }
+  });
+}
+
+function beginKonomiPolling() {
+  konomiActive = true;
+  konomiOffset = 0;
+  konomiErrorCount = 0;
+  openKonomiTerminal();
+  setKonomiUI(true);
+  pollKonomi();
+}
+
+async function startKonomiUpdate() {
+  try {
+    const st = await api('GET', '/api/konomitv-update/status');
+    if (st.running) { beginKonomiPolling(); return; }
+  } catch (e) {}
+  if (!confirm('KonomiTV のアップデート (インストーラー再実行) を開始しますか？\n\n・最新インストーラーをダウンロードして対話モードで起動します\n・処理の完了後、KonomiTV が再起動され視聴中の番組は中断されます\n・インストーラーの質問には下のターミナル入力欄から回答してください')) return;
+  try {
+    const resp = await api('POST', '/api/konomitv-update/start');
+    if (resp && resp.error) {
+      showToast(resp.error, 'error');
+      return;
+    }
+  } catch (e) {
+    showToast('アップデートを開始できませんでした', 'error');
+    return;
+  }
+  showToast('インストーラーを起動しました。ターミナルで対話してください', 'info');
+  beginKonomiPolling();
+}
+
+async function sendKonomiInput() {
+  const inp = document.getElementById('konomi-input');
+  const value = inp.value;
+  inp.value = '';
+  inp.focus();
+  try {
+    const resp = await api('POST', '/api/konomitv-update/input', { data: value + '\r' });
+    if (resp && resp.error) showToast(resp.error, 'error');
+  } catch (e) {}
+}
+
+async function sendKonomiCtrlC() {
+  try {
+    await api('POST', '/api/konomitv-update/input', { data: '\x03' });
+    showToast('Ctrl+C を送信しました', 'info');
+  } catch (e) {}
+}
+
+async function initKonomiCard() {
+  document.getElementById('konomi-input').addEventListener('keydown', function(ev) {
+    if (ev.key === 'Enter') { ev.preventDefault(); sendKonomiInput(); }
+  });
+  // ページ読み込み時に実行中だった場合はターミナルを復元してポーリング再開
+  try {
+    const st = await api('GET', '/api/konomitv-update/status');
+    if (st.running) beginKonomiPolling();
+  } catch (e) {}
+}
+
 loadInfo();
 initScanCard();
+initKonomiCard();
 </script>
 </body>
 </html>
@@ -1323,7 +1718,7 @@ echo "=== セットアップ完了 ==="
 echo " ファイル: $INSTALL_DIR/"
 echo " サービス: systemctl status ${SERVICE_NAME}"
 echo " ポート: 80"
-echo " 機能: 再起動 / BCASキー / EPG状況 / チャンネルスキャン再実行 (ISDBScanner) / バックアップ / アップデート"
+echo " 機能: 再起動 / BCASキー / EPG状況 / チャンネルスキャン再実行 (ISDBScanner) / KonomiTV アップデート (対話ターミナル) / バックアップ / アップデート"
 echo " pm2: シンボリックリンクの作成/変更は行いません (既存の /usr/local/bin/pm2 をそのまま使用)"
 echo ""
 echo " アクセス:"
