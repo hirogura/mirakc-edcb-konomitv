@@ -510,7 +510,7 @@ echo ""
 PM2_REAL=""
 for c in "$(command -v pm2 2>/dev/null)" \
          /root/.nvm/versions/node/*/bin/pm2 \
-         "$HOME/.nvm/versions/node/"*/bin/pm2 \
+         "${HOME:-/root}/.nvm/versions/node/"*/bin/pm2 \
          /usr/local/lib/node_modules/pm2/bin/pm2; do
     if [ -n "$c" ] && [ -e "$c" ]; then
         PM2_REAL="$c"
@@ -1726,6 +1726,8 @@ Type=simple
 ExecStart=/usr/bin/python3 $INSTALL_DIR/server.py
 WorkingDirectory=$INSTALL_DIR
 Environment=PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/lib/node_modules/pm2/bin
+# HOME が無いと set -u のスクリプトや pm2 (~/.pm2 参照) が落ちるため明示する
+Environment=HOME=/root
 Restart=always
 RestartSec=3
 
