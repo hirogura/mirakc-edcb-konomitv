@@ -74,6 +74,7 @@ KonomiTV のセットアップが完了した後、Web ブラウザから各種�
 - EDCB / KonomiTV / mirakc の再起動
 - B-CAS キーの編集（保存すると mirakc を自動再起動）
 - EPG 取得状況の確認
+- チャンネルスキャンの再実行（ISDBScanner → mirakc / EDCB のチャンネル設定へ自動反映）
 - DTV 関連のバックアップ実行（`konomitv-backup.sh`）
 
 ![ロゴ画像](image-ph.png)
@@ -86,7 +87,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/hirogura/mirakc-edcb-konomit
 
 実行内容:
 
-1. 必要なファイル（`konomitv-backup.sh` / `server.py` / `index.html`）を `/opt/dtv-manage` に配置
+1. 必要なファイル（`konomitv-backup.sh` / `dtv-rescan.sh` / `server.py` / `index.html`）を `/opt/dtv-manage` に配置
 2. systemd サービス `dtv-manage` を登録・起動（ポート 80 で HTTP サーバーを立ち上げ）
 
 インストール完了後、`http://<コンテナのIPアドレス>/` にアクセスするとダッシュボードが表示されます。

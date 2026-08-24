@@ -245,6 +245,236 @@ BACKUPEOF
 
 sudo chmod +x "$INSTALL_DIR/konomitv-backup.sh"
 
+# dtv-rescan.sh
+# (Web UI の「チャンネルスキャン再実行」ボタンから server.py が
+#  バックグラウンド実行するスクリプト本体。
+#  ISDBScanner でスキャンし、結果を mirakc / EDCB の設定へ反映する。
+#  実行中はチューナーを占有するため視聴・録画は中断される。
+#  常に root [LXDコンテナ内] で実行される前提のため sudo は使用しない)
+sudo tee "$INSTALL_DIR/dtv-rescan.sh" > /dev/null << 'RESCANEOF'
+#!/bin/bash
+# =============================================================
+# dtv-rescan.sh - ISDBScanner チャンネルスキャン再実行 + mirakc/EDCB 反映
+# dtv-manage の Web UI (server.py) からバックグラウンド実行される。
+# 標準出力への出力は server.py がログファイルに書き出す。
+# =============================================================
+set -u
+
+export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH"
+
+RUNNING_FILE="/tmp/dtv-manage-rescan.running"
+EXIT_FILE="/tmp/dtv-manage-rescan.exit"
+
+DTV_DIR="/root/dtv"
+SCANNED_DIR="$DTV_DIR/scanned"
+MIRAKC_ETC="/etc/mirakc"
+EDCB_SETTING="/var/local/edcb/Setting"
+SCANNER_BIN="/usr/local/bin/isdb-scanner"
+SCANNER_URL="https://github.com/tsukumijima/ISDBScanner/releases/download/v1.3.3/isdb-scanner"
+SCANNER_TIMEOUT=600    # isdb-scanner 本体のタイムアウト (秒)
+SERVICE_SCAN_MAX=450   # mirakc サービススキャンの最大待機時間 (秒)
+
+# 完了・異常終了のいずれでもマーカーを必ず片付ける。
+# サーバー側はこのマーカーの有無で「実行中」判定を行うため、
+# 後始末漏れがあると二度とスキャンできなくなる。
+# (server.py 再起動の影響も受けないよう、削除はサーバーではなくここで行う)
+cleanup() {
+    rc=$?
+    rm -f "$RUNNING_FILE"
+    echo "$rc" > "$EXIT_FILE"
+    exit $rc
+}
+trap cleanup EXIT
+
+rm -f "$EXIT_FILE"
+
+say()  { echo "  $*"; }
+step() { echo ""; echo "=== $* ==="; }
+
+fail_exit() {
+    echo ""
+    echo "ERROR: $*"
+    exit 1
+}
+
+wait_mirakc() {
+    for _ in $(seq 1 30); do
+        if curl -s http://127.0.0.1:40772/api/tuners >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+# ---- 1/7 チューナー確認 ----
+step "1/7 チューナーの確認"
+TUNER_DEVICE="$(ls /dev/isdb2056video* 2>/dev/null | head -1 || true)"
+if [ -z "$TUNER_DEVICE" ]; then
+    TUNER_DEVICE="$(ls /dev/px4video* 2>/dev/null | head -1 || true)"
+fi
+[ -n "$TUNER_DEVICE" ] || fail_exit "チューナーデバイス (/dev/isdb2056video* または /dev/px4video*) が検出できません"
+say "チューナー検出: $TUNER_DEVICE"
+
+# ---- 2/7 サービス停止 (チューナー解放) ----
+# 稼働中の mirakc/EDCB がチューナーを掴んでいると、ISDBScanner が
+# チューナーを開けずサイレントに 0 件スキャンになることがある
+step "2/7 mirakc / EDCB を一時停止 (チューナーを解放)"
+systemctl stop mirakc 2>/dev/null || true
+systemctl stop edcb 2>/dev/null || true
+sleep 2
+say "停止しました"
+
+# ---- 3/7 ISDBScanner 準備 ----
+step "3/7 ISDBScanner の準備"
+if [ ! -x "$SCANNER_BIN" ]; then
+    say "isdb-scanner が見つからないためダウンロードします..."
+    wget -q "$SCANNER_URL" -O "$SCANNER_BIN" || fail_exit "ISDBScanner のダウンロードに失敗しました"
+    chmod +x "$SCANNER_BIN"
+fi
+say "isdb-scanner を確認しました"
+
+# ---- 4/7 スキャン実行 ----
+step "4/7 チャンネルスキャンを実行中 (最長 ${SCANNER_TIMEOUT}秒)"
+rm -rf "$SCANNED_DIR"
+mkdir -p "$SCANNED_DIR"
+timeout "$SCANNER_TIMEOUT" "$SCANNER_BIN" "$SCANNED_DIR/"
+SCAN_RC=$?
+[ "$SCAN_RC" -eq 0 ] || fail_exit "isdb-scanner が異常終了しました (終了コード: $SCAN_RC)"
+
+MIRAKC_CONFIG_SRC="$SCANNED_DIR/mirakc/config.yml"
+[ -f "$MIRAKC_CONFIG_SRC" ] || {
+    find "$SCANNED_DIR" -type f 2>/dev/null || true
+    fail_exit "$MIRAKC_CONFIG_SRC が生成されませんでした"
+}
+CH_COUNT="$(grep -c '^[[:space:]]*- name:' "$MIRAKC_CONFIG_SRC" 2>/dev/null || true)"
+CH_COUNT="${CH_COUNT:-0}"
+[ "$CH_COUNT" -gt 0 ] || fail_exit "スキャン結果のチャンネルが 0 件です。アンテナ線・B-CASキーを確認してください"
+say "${CH_COUNT} チャンネルを検出しました"
+
+# ---- 5/7 mirakc 反映 ----
+step "5/7 mirakc へ反映"
+mkdir -p "$MIRAKC_ETC"
+cp "$MIRAKC_CONFIG_SRC" "$MIRAKC_ETC/config.yml"
+
+# scan-services 等の定期ジョブを無効化する。
+# インストーラと同じく Python でパースして上書きする
+# (sed だと YAML 内に重複キーが残る不具合があるため)
+python3 << 'PYEOF'
+import re
+
+path = "/etc/mirakc/config.yml"
+with open(path, "r", encoding="utf-8") as f:
+    content = f.read()
+
+if re.search(r"^jobs:\s*$", content, re.MULTILINE):
+    for job in ("scan-services", "sync-clocks", "update-schedules"):
+        pattern = re.compile(
+            r"(^\s*" + re.escape(job) + r":\s*\n(?:\s+\S.*\n)*?\s*disabled:\s*)(true|false)",
+            re.MULTILINE,
+        )
+        if pattern.search(content):
+            content = pattern.sub(lambda m: m.group(1) + "true", content)
+        else:
+            job_pattern = re.compile(r"(^\s*" + re.escape(job) + r":\s*\n)", re.MULTILINE)
+            if job_pattern.search(content):
+                content = job_pattern.sub(lambda m: m.group(1) + "    disabled: true\n", content)
+            else:
+                content += f"\n  {job}:\n    disabled: true\n"
+else:
+    content += (
+        "\njobs:\n"
+        "  scan-services:\n    disabled: true\n"
+        "  sync-clocks:\n    disabled: true\n"
+        "  update-schedules:\n    disabled: true\n"
+    )
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(content)
+
+print("  jobs.* を無効化しました")
+PYEOF
+
+[ -f "$MIRAKC_ETC/strings.yml" ] || say "WARNING: strings.yml が存在しません。mirakc が起動しない場合は手動で配置してください"
+
+systemctl restart mirakc
+say "mirakc 再起動、応答を待機中..."
+wait_mirakc || fail_exit "mirakc が応答しません (journalctl -u mirakc -n 50 で確認してください)"
+say "mirakc 起動確認"
+
+# ---- 6/7 mirakc サービススキャン ----
+# 新しい channels 設定から services.json を作り直すため、
+# scan-services を一時的に有効化して mirakc を再起動する
+step "6/7 mirakc サービススキャン (最長 ${SERVICE_SCAN_MAX}秒)"
+sed -i '/scan-services:/,/disabled:/ s/disabled: true/disabled: false/' "$MIRAKC_ETC/config.yml"
+systemctl restart mirakc
+wait_mirakc || true
+
+SERVICE_COUNT=0
+SCAN_OK=false
+for i in $(seq 1 $((SERVICE_SCAN_MAX / 5))); do
+    SERVICE_COUNT="$(curl -s http://127.0.0.1:40772/api/services 2>/dev/null | grep -o '"id"' | wc -l || true)"
+    SERVICE_COUNT="${SERVICE_COUNT:-0}"
+    if [ "$SERVICE_COUNT" -gt 0 ]; then
+        SCAN_OK=true
+        break
+    fi
+    sleep 5
+    echo "  スキャン中... ($((i * 5))秒経過)"
+done
+if [ "$SCAN_OK" = true ]; then
+    say "${SERVICE_COUNT} 件のサービスを検出しました"
+else
+    say "WARNING: サービススキャンがタイムアウトしました (services 0 件)。mirakc ログを確認してください"
+fi
+
+# 起動のたびにチューナーを占有しないよう無効化に戻す
+sed -i '/scan-services:/,/disabled:/ s/disabled: false/disabled: true/' "$MIRAKC_ETC/config.yml"
+systemctl restart mirakc
+wait_mirakc || true
+say "mirakc 再起動完了 (scan-services を無効化)"
+
+# ---- 7/7 EDCB 反映 + 各サービス再起動 ----
+step "7/7 EDCB へ反映・各サービス再起動"
+if [ -f "$SCANNED_DIR/EDCB-Wine/ChSet5.txt" ]; then
+    mkdir -p "$EDCB_SETTING"
+    cp "$SCANNED_DIR/EDCB-Wine/ChSet5.txt" "$EDCB_SETTING/ChSet5.txt"
+    say "ChSet5.txt を更新しました"
+else
+    say "WARNING: $SCANNED_DIR/EDCB-Wine/ChSet5.txt がないため EDCB の ChSet5 は変更していません"
+fi
+if [ -f "$SCANNED_DIR/EDCB-Wine/BonDriver_mirakc(BonDriver_mirakc).ChSet4.txt" ]; then
+    mkdir -p "$EDCB_SETTING"
+    cp "$SCANNED_DIR/EDCB-Wine/BonDriver_mirakc(BonDriver_mirakc).ChSet4.txt" \
+       "$EDCB_SETTING/BonDriver_LinuxMirakc(LinuxMirakc).ChSet4.txt"
+    say "BonDriver_LinuxMirakc(LinuxMirakc).ChSet4.txt を更新しました"
+fi
+
+if [ -f /etc/systemd/system/edcb.service ]; then
+    systemctl restart edcb
+    say "edcb を再起動しました"
+fi
+
+PM2_BIN="$(command -v pm2 2>/dev/null || true)"
+[ -z "$PM2_BIN" ] && PM2_BIN="/usr/local/lib/node_modules/pm2/bin/pm2"
+if [ -x "$PM2_BIN" ]; then
+    if "$PM2_BIN" restart KonomiTV >/dev/null 2>&1; then
+        say "KonomiTV を再起動しました (チャンネル一覧を再取得)"
+    else
+        say "WARNING: KonomiTV の再起動に失敗しました"
+    fi
+else
+    say "pm2 が見つからないため KonomiTV の再起動をスキップします"
+fi
+
+echo ""
+echo "EPG データは mirakc / EDCB の定期受信で自動更新されます"
+echo ""
+echo "=== チャンネルスキャン再実行 完了 (${CH_COUNT} チャンネル) ==="
+RESCANEOF
+
+sudo chmod +x "$INSTALL_DIR/dtv-rescan.sh"
+
 # server.py
 sudo tee "$INSTALL_DIR/server.py" > /dev/null << 'PYEOF'
 #!/usr/bin/env python3
@@ -254,16 +484,26 @@ import os
 import socketserver
 import subprocess
 import urllib.parse
+from datetime import datetime
 
 PORT = 80
 BASE = "/opt/dtv-manage"
 SERVICE_NAME = "dtv-manage"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 # アップデート処理の状態管理用ファイル (/tmp に置くため再起動で自然にクリアされる)
 UPDATE_RUNNING_FILE = "/tmp/dtv-manage-update.running"
 UPDATE_EXIT_FILE = "/tmp/dtv-manage-update.exit"
 UPDATE_LOG_FILE = "/tmp/dtv-manage-update.log"
+
+# チャンネルスキャン再実行 (ISDBScanner) の状態管理用ファイル。
+# 実行中マーカーの削除は dtv-rescan.sh 側の trap EXIT が行うため、
+# サーバーを再起動してもスキャン処理の状態を見失わない
+RESCAN_RUNNING_FILE = "/tmp/dtv-manage-rescan.running"
+RESCAN_EXIT_FILE = "/tmp/dtv-manage-rescan.exit"
+RESCAN_LOG_FILE = "/tmp/dtv-manage-rescan.log"
+RESCAN_SCRIPT = os.path.join(BASE, "dtv-rescan.sh")
+SCANNED_CONFIG = "/root/dtv/scanned/mirakc/config.yml"
 
 # GitHub から最新のインストーラを取得して実行するコマンド
 # (install-dtv-manage.sh 自体が最後に dtv-manage サービスを再起動するため、
@@ -368,6 +608,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_get_bcas()
         elif path == "/api/update/status":
             self.handle_update_status()
+        elif path == "/api/rescan/status":
+            self.handle_rescan_status()
         else:
             self.send_error(404, "Not Found")
 
@@ -388,6 +630,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_update()
         elif path == "/api/backup":
             self.handle_backup()
+        elif path == "/api/rescan":
+            self.handle_rescan()
         elif path == "/api/bcas-keys":
             self.handle_save_bcas(body)
         else:
@@ -450,6 +694,74 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error_json(f"スクリプトが見つかりません: {script_path}")
         except Exception as e:
             self.send_error_json(str(e))
+
+    def get_scan_info(self):
+        info = {"scan_exists": False, "channel_count": None, "scanned_at": None}
+        try:
+            if os.path.isfile(SCANNED_CONFIG):
+                info["scan_exists"] = True
+                result = subprocess.run(
+                    ["grep", "-c", "^[[:space:]]*- name:", SCANNED_CONFIG],
+                    capture_output=True, text=True, timeout=5
+                )
+                try:
+                    info["channel_count"] = int(result.stdout.strip())
+                except ValueError:
+                    info["channel_count"] = 0
+                info["scanned_at"] = datetime.fromtimestamp(
+                    os.path.getmtime(SCANNED_CONFIG)
+                ).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+        return info
+
+    def handle_rescan(self):
+        # 同時実行防止 (マーカーは dtv-rescan.sh の trap EXIT が削除する)
+        if os.path.exists(RESCAN_RUNNING_FILE):
+            self.send_error_json("チャンネルスキャンが既に実行中です")
+            return
+        if not os.path.exists(RESCAN_SCRIPT):
+            self.send_error_json(f"スクリプトが見つかりません: {RESCAN_SCRIPT}")
+            return
+        try:
+            with open(RESCAN_RUNNING_FILE, "w") as f:
+                f.write(str(os.getpid()))
+            if os.path.exists(RESCAN_EXIT_FILE):
+                os.remove(RESCAN_EXIT_FILE)
+            with open(RESCAN_LOG_FILE, "w") as log_f:
+                subprocess.Popen(
+                    ["bash", RESCAN_SCRIPT],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_f,
+                    stderr=subprocess.STDOUT,
+                    env=ENV,
+                    start_new_session=True
+                )
+            self.send_json({"success": True})
+        except Exception as e:
+            try:
+                os.remove(RESCAN_RUNNING_FILE)
+            except OSError:
+                pass
+            self.send_error_json(str(e))
+
+    def handle_rescan_status(self):
+        running = os.path.exists(RESCAN_RUNNING_FILE)
+        log_tail = ""
+        try:
+            with open(RESCAN_LOG_FILE, "r", errors="replace") as f:
+                log_tail = f.read()[-4000:]
+        except FileNotFoundError:
+            pass
+        exit_code = None
+        try:
+            with open(RESCAN_EXIT_FILE) as f:
+                exit_code = int(f.read().strip())
+        except (FileNotFoundError, ValueError):
+            pass
+        data = {"running": running, "exit": exit_code, "log": log_tail}
+        data.update(self.get_scan_info())
+        self.send_json(data)
 
     def handle_get_bcas(self):
         try:
@@ -630,6 +942,17 @@ textarea.bcas-editor:focus{outline:none;border-color:#38bdf8}
       <button class="btn btn-restart" onclick="restartService('mirakc')">mirakc 再起動</button>
     </div>
     <div class="output-box" id="restart-output"></div>
+  </div>
+  <div class="card">
+    <h2><span class="icon">&#128225;</span> ISDBScanner</h2>
+    <div class="info-row">
+      <span class="info-label">前回スキャン結果</span>
+      <span class="info-value" id="rescan-info">Loading...</span>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-success" id="rescan-btn" onclick="runRescan()">チャンネルスキャン再実行</button>
+    </div>
+    <div class="output-box" id="rescan-output"></div>
   </div>
   <div class="card">
     <h2><span class="icon">&#128273;</span> BCASキー設定</h2>
@@ -880,7 +1203,92 @@ async function saveBcasKeys() {
   }
 }
 
+function formatScanInfo(data) {
+  if (!data || !data.scan_exists) return '(スキャン結果なし)';
+  let txt = (data.channel_count !== null && data.channel_count !== undefined)
+    ? data.channel_count + ' チャンネル' : 'スキャン済み';
+  if (data.scanned_at) txt += ' / ' + data.scanned_at;
+  return txt;
+}
+
+async function refreshScanInfo() {
+  try {
+    const st = await api('GET', '/api/rescan/status');
+    document.getElementById('rescan-info').textContent = formatScanInfo(st);
+    return st;
+  } catch (e) {
+    document.getElementById('rescan-info').textContent = '-';
+    return null;
+  }
+}
+
+async function runRescan() {
+  if (!confirm('ISDBScanner でチャンネルスキャンを再実行しますか？\n\n・実行中はチューナーを占有するため視聴中の番組が中断されます\n・録画中の場合は録画に失敗するので注意してください\n・スキャンと mirakc/EDCB への反映まで数分〜十数分かかります')) return;
+  const btn = document.getElementById('rescan-btn');
+  btn.disabled = true;
+  try {
+    const resp = await api('POST', '/api/rescan');
+    if (resp && resp.error) {
+      showToast(resp.error, 'error');
+      btn.disabled = false;
+      return;
+    }
+  } catch (e) {
+    showToast('スキャンを開始できませんでした', 'error');
+    btn.disabled = false;
+    return;
+  }
+  showToast('チャンネルスキャンを実行中です...', 'info');
+  showOutput('rescan-output', 'チャンネルスキャンを実行中...');
+  pollRescan(0, btn);
+}
+
+async function pollRescan(elapsed, btn) {
+  await sleep(3000);
+  elapsed += 3;
+  let st;
+  try {
+    st = await api('GET', '/api/rescan/status');
+  } catch (e) {
+    if (elapsed < 1800) { pollRescan(elapsed, btn); } else { rescanGiveUp(btn); }
+    return;
+  }
+  if (st.running) {
+    showOutput('rescan-output',
+      'スキャン実行中... (' + Math.floor(elapsed / 60) + '分' + (elapsed % 60) + '秒経過)\n\n' + (st.log || ''));
+    const out = document.getElementById('rescan-output');
+    out.scrollTop = out.scrollHeight;
+    if (elapsed < 1800) { pollRescan(elapsed, btn); } else { rescanGiveUp(btn); }
+    return;
+  }
+  // 終了: exit コードを確認
+  // (exit ファイルなし = サーバー再起動等で記録を取りこぼした場合なので成功扱い)
+  const ok = (st.exit === null || st.exit === undefined || st.exit === 0);
+  showOutput('rescan-output',
+    (st.log || '') + '\n' + (ok ? '=== チャンネルスキャン完了 ===' : '=== チャンネルスキャン失敗 (exit=' + st.exit + ') ==='));
+  showToast(ok ? 'スキャン完了: ' + formatScanInfo(st) : 'チャンネルスキャンに失敗しました', ok ? 'success' : 'error');
+  document.getElementById('rescan-info').textContent = formatScanInfo(st);
+  btn.disabled = false;
+}
+
+function rescanGiveUp(btn) {
+  showToast('状態取得を中断しました。処理はバックグラウンドで継続している場合があります', 'error');
+  btn.disabled = false;
+}
+
+async function initScanCard() {
+  const st = await refreshScanInfo();
+  // ページ読み込み時にスキャン中だった場合はポーリングを再開する
+  if (st && st.running) {
+    const btn = document.getElementById('rescan-btn');
+    btn.disabled = true;
+    showOutput('rescan-output', 'スキャン実行中...\n\n' + (st.log || ''));
+    pollRescan(0, btn);
+  }
+}
+
 loadInfo();
+initScanCard();
 </script>
 </body>
 </html>
@@ -915,6 +1323,7 @@ echo "=== セットアップ完了 ==="
 echo " ファイル: $INSTALL_DIR/"
 echo " サービス: systemctl status ${SERVICE_NAME}"
 echo " ポート: 80"
+echo " 機能: 再起動 / BCASキー / EPG状況 / チャンネルスキャン再実行 (ISDBScanner) / バックアップ / アップデート"
 echo " pm2: シンボリックリンクの作成/変更は行いません (既存の /usr/local/bin/pm2 をそのまま使用)"
 echo ""
 echo " アクセス:"
