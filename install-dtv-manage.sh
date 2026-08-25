@@ -23,6 +23,10 @@ fi
 
 # ディレクトリ作成
 sudo mkdir -p "$INSTALL_DIR"
+sudo mkdir -p /opt/lxd-data/konomitv-backup
+# LXD コンテナの UID マッピングでホスト側 root (UID 0) が nobody にマッピングされ、
+# コンテナ内 root からバックアップ先に書き込めなくなることがあるため 777 に緩和
+sudo chmod 777 /opt/lxd-data/konomitv-backup 2>/dev/null || true
 
 # konomitv-backup.sh
 # (Web UI の「DTV関連バックアップ」ボタンから server.py が実行するスクリプト本体。
@@ -44,6 +48,18 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 BACKUP_BASE="/opt/lxd-data/konomitv-backup"
+
+# バックアップ先ディレクトリの確認・作成
+# (server.py から呼ばれた場合、親ディレクトリが未作成で Permission denied になることがある)
+if ! mkdir -p "$BACKUP_BASE" 2>/dev/null; then
+    echo "エラー: バックアップ先 $BACKUP_BASE を作成/アクセスできません。"
+    echo "  以下のコマンドを手動で実行してから再試行してください:"
+    echo "    sudo mkdir -p $BACKUP_BASE && sudo chmod 777 $BACKUP_BASE"
+    exit 1
+fi
+# LXD コンテナの UID マッピングにより、ホスト側 root (UID 0) が nobody にマッピングされ
+# コンテナ内 root でも書き込めなくなることがある。事前に権限を緩和する。
+chmod 777 "$BACKUP_BASE" 2>/dev/null || true
 
 # ------------------------------------------------------------
 # DTV_DIR について:
@@ -591,7 +607,7 @@ from datetime import datetime
 PORT = 80
 BASE = "/opt/dtv-manage"
 SERVICE_NAME = "dtv-manage"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.3"
 
 # アップデート処理の状態管理用ファイル (/tmp に置くため再起動で自然にクリアされる)
 UPDATE_RUNNING_FILE = "/tmp/dtv-manage-update.running"
@@ -928,6 +944,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def handle_backup(self):
         script_path = os.path.join(BASE, "konomitv-backup.sh")
+        backup_base = "/opt/lxd-data/konomitv-backup"
+        try:
+            os.makedirs(backup_base, exist_ok=True)
+        except OSError as e:
+            self.send_error_json(
+                f"バックアップ先ディレクトリ {backup_base} を作成できません: {e}"
+            )
+            return
         try:
             result = subprocess.run(
                 ["bash", script_path],
