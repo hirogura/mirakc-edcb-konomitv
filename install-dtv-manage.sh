@@ -607,7 +607,7 @@ from datetime import datetime
 PORT = 80
 BASE = "/opt/dtv-manage"
 SERVICE_NAME = "dtv-manage"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.3.0"
 
 # アップデート処理の状態管理用ファイル (/tmp に置くため再起動で自然にクリアされる)
 UPDATE_RUNNING_FILE = "/tmp/dtv-manage-update.running"
@@ -861,6 +861,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(KONOMI_SESSION.status())
         elif path == "/api/konomitv-update/output":
             self.handle_konomi_output()
+        elif path == "/api/backup/check":
+            self.handle_backup_check()
+        elif path == "/api/backup/export":
+            self.handle_backup_export()
         else:
             self.send_error(404, "Not Found")
 
@@ -968,6 +972,63 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error_json(f"スクリプトが見つかりません: {script_path}")
         except Exception as e:
             self.send_error_json(str(e))
+
+    def handle_backup_check(self):
+        backup_base = "/opt/lxd-data/konomitv-backup"
+        exists = os.path.isdir(backup_base) and bool(os.listdir(backup_base))
+        self.send_json({"exists": exists, "dir": backup_base})
+
+    def handle_backup_export(self):
+        # /opt/lxd-data/konomitv-backup を tar.gz に固めてストリームで送信する
+        # (全体をメモリに載せず tar の stdout を直接流すため大容量でも安心)
+        backup_base = "/opt/lxd-data/konomitv-backup"
+        if not os.path.isdir(backup_base) or not os.listdir(backup_base):
+            self.send_error_json(
+                "バックアップがまだありません。「DTV関連バックアップ」を先に実行してください。"
+            )
+            return
+        filename = "konomitv-backup-{}.tar.gz".format(
+            datetime.now().strftime("%Y%m%d-%H%M%S")
+        )
+        # ダウンロードに時間がかかっても 10 秒ソケットタイムアウトで切れないよう解除する
+        try:
+            self.connection.settimeout(None)
+        except OSError:
+            pass
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header(
+            "Content-Disposition",
+            'attachment; filename="{}"'.format(filename),
+        )
+        self.send_header("Cache-Control", "no-cache")
+        # Content-Length を出さず EOF まで読む方式のため、送信後に接続を閉じる
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                ["tar", "-czf", "-", "-C", backup_base, "."],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=ENV,
+            )
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+            proc.wait()
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+        finally:
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
     def get_scan_info(self):
         info = {"scan_exists": False, "channel_count": None, "scanned_at": None}
@@ -1293,6 +1354,7 @@ textarea.bcas-editor:focus{outline:none;border-color:#38bdf8}
     </div>
     <div class="btn-group">
       <button class="btn btn-success" id="backup-btn" onclick="runBackup()">DTV関連バックアップ</button>
+      <button class="btn btn-secondary" onclick="exportBackup()">バックアップをエクスポート</button>
     </div>
     <div class="output-box" id="backup-output"></div>
   </div>
@@ -1420,6 +1482,26 @@ async function runBackup() {
     btn.disabled = false;
     btn.textContent = 'DTV関連バックアップ';
   }
+}
+
+async function exportBackup() {
+  if (!confirm('/opt/lxd-data/konomitv-backup を tar.gz に固めてダウンロードしますか？\n(数GBになる場合があるため、事前に DTV関連バックアップ を実行してください)')) return;
+  try {
+    const st = await api('GET', '/api/backup/check');
+    if (st && st.exists === false) {
+      showToast('バックアップがありません。先に「DTV関連バックアップ」を実行してください', 'error');
+      return;
+    }
+  } catch (e) {
+    showToast('バックアップ状態の確認に失敗しました', 'error');
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = '/api/backup/export';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  showToast('バックアップのダウンロードを開始しました', 'info');
 }
 
 async function restartSelf() {
