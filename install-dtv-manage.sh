@@ -1485,7 +1485,7 @@ async function runBackup() {
 }
 
 async function exportBackup() {
-  if (!confirm('/opt/lxd-data/konomitv-backup を tar.gz に固めてダウンロードしますか？\n(数GBになる場合があるため、事前に DTV関連バックアップ を実行してください)')) return;
+  if (!confirm('/opt/lxd-data/konomitv-backup を tar.gz に固めてダウンロードしますか？\n(事前に DTV関連バックアップ を実行してください)')) return;
   try {
     const st = await api('GET', '/api/backup/check');
     if (st && st.exists === false) {
